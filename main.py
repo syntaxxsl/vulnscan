@@ -1,10 +1,18 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
+import sqlite3
 
-app = FastAPI(title="VulnScan API")
+app = FastAPI(title="VulnScan API", docs_url="/docs")
 
-# Bellekte tutulan geçici liste
-targets_db = []
+# Veritabanı bağlantısı (Şimdilik SQLite kullanıyoruz, dosya olarak Render'da saklanır)
+def init_db():
+    conn = sqlite3.connect("vulnscan.db")
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS targets (id INTEGER PRIMARY KEY, domain TEXT UNIQUE)''')
+    conn.commit()
+    conn.close()
+
+init_db()
 
 class TargetCreate(BaseModel):
     domain: str
@@ -15,11 +23,23 @@ def read_root():
 
 @app.post("/targets")
 def add_target(target: TargetCreate):
-    if target.domain in targets_db:
+    conn = sqlite3.connect("vulnscan.db")
+    c = conn.cursor()
+    try:
+        c.execute("INSERT INTO targets (domain) VALUES (?)", (target.domain,))
+        conn.commit()
+        return {"message": f"{target.domain} hedef listesine eklendi"}
+    except sqlite3.IntegrityError:
         return {"error": "Bu hedef zaten listede var"}
-    targets_db.append(target.domain)
-    return {"message": f"{target.domain} hedef listesine eklendi", "total": len(targets_db)}
+    finally:
+        conn.close()
 
 @app.get("/targets")
 def list_targets():
-    return {"targets": targets_db}
+    conn = sqlite3.connect("vulnscan.db")
+    c = conn.cursor()
+    c.execute("SELECT domain FROM targets")
+    rows = c.fetchall()
+    conn.close()
+    targets = [row[0] for row in rows]
+    return {"targets": targets}
