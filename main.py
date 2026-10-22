@@ -1,10 +1,9 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
-import uvicorn
 
 app = FastAPI(title="VulnScan API")
 
-# Bellekte tutulan geçici liste (Sonra veritabanına bağlayacağız)
+# Bellekte tutulan geçici liste
 targets_db = []
 
 class TargetCreate(BaseModel):
@@ -24,4 +23,3 @@ def add_target(target: TargetCreate):
 @app.get("/targets")
 def list_targets():
     return {"targets": targets_db}
-
