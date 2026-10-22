@@ -25,5 +25,3 @@ def add_target(target: TargetCreate):
 def list_targets():
     return {"targets": targets_db}
 
-if name == "main":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
