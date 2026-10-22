@@ -43,3 +43,4 @@ def list_targets():
     conn.close()
     targets = [row[0] for row in rows]
     return {"targets": targets}
+app.openapi_url = "/openapi.json"
