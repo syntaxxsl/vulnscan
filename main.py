@@ -2,9 +2,9 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 import sqlite3
 
-app = FastAPI(title="VulnScan API", docs_url="/docs")
+app = FastAPI(title="VulnScan API")
 
-# Veritabanı bağlantısı (Şimdilik SQLite kullanıyoruz, dosya olarak Render'da saklanır)
+# Veritabanı başlatma
 def init_db():
     conn = sqlite3.connect("vulnscan.db")
     c = conn.cursor()
