@@ -1,6 +1,8 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 import sqlite3
+import subprocess
+import asyncio
 
 app = FastAPI(title="VulnScan API")
 
@@ -43,4 +45,29 @@ def list_targets():
     conn.close()
     targets = [row[0] for row in rows]
     return {"targets": targets}
-app.openapi_url = "/openapi.json"
+
+# YENİ EKLENEN KISIM: Nmap Tarama Motoru
+@app.get("/scan/{domain}")
+async def scan_target(domain: str):
+    try:
+        # Nmap ile en yaygın portları ve servisleri tara (-F hızlı tarama yapar)
+        process = await asyncio.create_subprocess_exec(
+            "nmap", "-F", "-sV", domain,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+        
+        if process.returncode == 0:
+            return {
+                "status": "success",
+                "target": domain,
+                "output": stdout.decode()
+            }
+        else:
+            return {
+                "status": "error",
+                "message": stderr.decode()
+            }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
