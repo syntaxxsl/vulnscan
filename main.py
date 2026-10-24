@@ -1,12 +1,11 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 import sqlite3
-import subprocess
+import socket
 import asyncio
 
 app = FastAPI(title="VulnScan API")
 
-# Veritabanı başlatma
 def init_db():
     conn = sqlite3.connect("vulnscan.db")
     c = conn.cursor()
@@ -46,28 +45,35 @@ def list_targets():
     targets = [row[0] for row in rows]
     return {"targets": targets}
 
-# YENİ EKLENEN KISIM: Nmap Tarama Motoru
+# SOKET TABANLI PORT TARAYICI (Nmap gerektirmez)
+def check_port(host, port):
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.5)
+            if s.connect_ex((host, port)) == 0:
+                return port
+    except:
+        pass
+    return None
+
 @app.get("/scan/{domain}")
 async def scan_target(domain: str):
     try:
-        # Nmap ile en yaygın portları ve servisleri tara (-F hızlı tarama yapar)
-        process = await asyncio.create_subprocess_exec(
-            "nmap", "-F", "-sV", domain,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await process.communicate()
+        # En yaygın portları kontrol ediyoruz
+        common_ports = [21, 22, 23, 25, 53, 80, 110, 143, 443, 3306, 8080, 8443]
+        open_ports = []
         
-        if process.returncode == 0:
-            return {
-                "status": "success",
-                "target": domain,
-                "output": stdout.decode()
-            }
-        else:
-            return {
-                "status": "error",
-                "message": stderr.decode()
-            }
+        # Asenkron döngü ile portları kontrol et
+        for port in common_ports:
+            result = await asyncio.to_thread(check_port, domain, port)
+            if result:
+                open_ports.append(result)
+                
+        return {
+            "status": "success",
+            "target": domain,
+            "open_ports": open_ports,
+            "message": f"{len(open_ports)} adet açık port bulundu."
+        }
     except Exception as e:
         return {"status": "error", "message": str(e)}
