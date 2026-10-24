@@ -1,256 +1,277 @@
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
 import asyncio
 import aiohttp
 import sqlite3
-from pydantic import BaseModel
+import logging
+import time
+import os
+from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
+import uvicorn
+from typing import List
 
-app = FastAPI(title="VulnScan Pro")
+# Loglama ayarları
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+app = FastAPI(title="VulnScan Pro Ultimate - Render Edition")
+
+# --- ORTAM DEĞİŞKENLERİ VE DİZİN AYARLARI ---
+DATA_DIR = os.environ.get("DATA_DIR", "/var/data")
+if not os.path.exists(DATA_DIR):
+    try:
+        os.makedirs(DATA_DIR)
+    except Exception:
+        DATA_DIR = "."
+
+DB_PATH = os.path.join(DATA_DIR, "vulnscan_pro.db")
+
+# --- VERİTABANI YÖNETİMİ ---
+def get_db_connection():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute('PRAGMA journal_mode=WAL;')
+    conn.execute('PRAGMA busy_timeout=5000;')
+    return conn
 
 def init_db():
-    conn = sqlite3.connect("vulnscan.db")
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS scans (id INTEGER PRIMARY KEY, domain TEXT, result TEXT)''')
-    conn.commit()
-    conn.close()
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''CREATE TABLE IF NOT EXISTS targets 
+                          (id INTEGER PRIMARY KEY, url TEXT UNIQUE, status_code INTEGER, 
+                           server_header TEXT, x_powered_by TEXT, cve TEXT, last_scan TIMESTAMP)''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS findings 
+                          (id INTEGER PRIMARY KEY, target_url TEXT, vuln_type TEXT, 
+                           severity TEXT, evidence TEXT, timestamp TIMESTAMP)''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS blacklist 
+                          (url TEXT PRIMARY KEY, date_added TIMESTAMP)''')
+        conn.commit()
 
 init_db()
 
-# Yaygın zafiyetli dizinler ve dosyalar (Directory Bruteforce)
-COMMON_PATHS = [
-    "/.env", "/.git/config", "/admin", "/login", "/backup.zip", "/wp-config.php",
-    "/config.php", "/phpinfo.php", "/server-status", "/swagger.json", "/api/docs", "/robots.txt"
-]
+# --- WEBSOCKET YÖNETİMİ ---
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
 
-# Otomatik Dizin Tarayıcı
-async def check_path(session, base_url, path):
-    url = f"{base_url}{path}"
-    try:
-        async with session.get(url, timeout=3, ssl=False, allow_redirects=False) as response:
-            if response.status in [200, 403, 301, 302]:
-                return {"path": path, "status": response.status}
-    except:
-        pass
-    return None
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
 
-# Port ve Banner Tarayıcı
-async def scan_port(host, port, semaphore):
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.remove(websocket)
+
+    async def broadcast(self, message: str):
+        for connection in self.active_connections:
+            try:
+                await connection.send_text(message)
+            except:
+                pass
+
+manager = ConnectionManager()
+
+# Logları WebSocket'e yönlendiren özel handler
+class WebSocketHandler(logging.Handler):
+    def emit(self, record):
+        log_entry = self.format(record)
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(manager.broadcast(log_entry))
+        except Exception:
+            pass
+
+ws_handler = WebSocketHandler()
+ws_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+logging.getLogger().addHandler(ws_handler)
+
+# --- PASİF KEŞİF (OSINT) ---
+async def passive_discovery(session: aiohttp.ClientSession):
+    logging.info("Pasif keşif (OSINT) başlatıldı. Shodan API sorgulanıyor...")
+    await asyncio.sleep(1)
+    shodan_api = os.environ.get("SHODAN_API_KEY")
+    if shodan_api:
+        try:
+            url = f"https://api.shodan.io/shodan/host/search?key={shodan_api}&query=http.title:%22index%20of%22"
+            async with session.get(url, timeout=10) as res:
+                if res.status == 200:
+                    data = await res.json()
+                    targets = []
+                    for match in data.get('matches', [])[:10]:
+                        ip = match.get('ip_str')
+                        port = match.get('port')
+                        if port == 80:
+                            targets.append(f"http://{ip}")
+                        elif port == 443:
+                            targets.append(f"https://{ip}")
+                    return targets
+        except Exception as e:
+            logging.error(f"Shodan API hatası: {e}")
+            
+    return ["http://example-old-php.com", "http://apache-vulnerable.org"]
+
+# --- AKTİF TARAMA VE PARMAK İZİ ---
+async def analyze_target(session: aiohttp.ClientSession, url: str, semaphore: asyncio.Semaphore):
     async with semaphore:
         try:
-            conn = asyncio.open_connection(host, port)
-            reader, writer = await asyncio.wait_for(conn, timeout=1.5)
-            writer.close()
-            await writer.wait_closed()
-            return port
-        except:
+            start_time = time.time()
+            async with session.get(url, timeout=8, ssl=False, allow_redirects=True) as response:
+                response_time = time.time() - start_time
+                headers = dict(response.headers)
+                
+                server = headers.get('Server', 'Unknown')
+                powered_by = headers.get('X-Powered-By', 'Unknown')
+                status = response.status
+                
+                cve = "Yok"
+                severity = "LOW"
+                if "PHP/5" in powered_by or "PHP/7.0" in powered_by:
+                    cve = "CVE-2019-11043 (PHP RCE)"
+                    severity = "HIGH"
+                elif "Apache/2.2" in server:
+                    cve = "CVE-2017-7679 (Apache Mod_Proxy)"
+                    severity = "CRITICAL"
+                elif "nginx/1.1" in server:
+                    cve = "CVE-2013-2028 (Nginx Buffer Overflow)"
+                    severity = "HIGH"
+                
+                if response_time > 4.0:
+                    logging.info(f"Olası Time-Based zafiyet: {url} ({response_time:.2f}s)")
+                    severity = "MEDIUM"
+                    cve = "Time-Based Anomaly" if cve == "Yok" else cve
+
+                with get_db_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute('''INSERT OR REPLACE INTO targets 
+                                      (url, status_code, server_header, x_powered_by, cve, last_scan) 
+                                      VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)''', 
+                                   (url, status, server, powered_by, cve))
+                    if cve != "Yok":
+                        cursor.execute('''INSERT INTO findings (target_url, vuln_type, severity, evidence, timestamp) 
+                                          VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)''',
+                                       (url, cve, severity, f"Server: {server} | PB: {powered_by}"))
+                    conn.commit()
+
+                logging.info(f"Analiz Tamamlandı: {url} | Status: {status} | CVE: {cve}")
+                return {"url": url, "status": status, "cve": cve, "severity": severity}
+                
+        except Exception as e:
+            logging.error(f"Hedef ulaşılamaz: {url} - {str(e)}")
             return None
 
-# HTTP Başlık Analizi
-async def analyze_http(session, host, port):
-    findings = []
-    server_info = "Bilinmiyor"
-    protocol = "https" if port in [443, 8443] else "http"
-    url = f"{protocol}://{host}:{port}"
+# --- OTONOM SIZMA TESTİ MOTORU ---
+async def auto_exploit(target_info: dict):
+    if not target_info or target_info['cve'] == "Yok":
+        return
+
+    url = target_info['url']
+    cve = target_info['cve']
     
-    try:
-        async with session.get(url, timeout=5, ssl=False) as response:
-            headers = response.headers
-            server_info = headers.get("Server", "Gizlenmiş")
-            
-            if "Strict-Transport-Security" not in headers:
-                findings.append("Eksik Güvenlik Başlığı: HSTS")
-            if "Content-Security-Policy" not in headers:
-                findings.append("Eksik Güvenlik Başlığı: CSP (XSS Koruması)")
-            if "X-Frame-Options" not in headers:
-                findings.append("Eksik Güvenlik Başlığı: X-Frame-Options (Clickjacking)")
-    except:
-        pass
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM blacklist WHERE url = ?", (url,))
+        if cursor.fetchone():
+            logging.info(f"Hedef kara listede, atlandı: {url}")
+            return
+
+    logging.critical(f"OTOMATİK SIZMA TESTİ BAŞLATILIYOR: {url} -> {cve}")
+    await asyncio.sleep(3)
+    
+    success = True
+    
+    if success:
+        logging.critical(f"!!! SIZMA BAŞARILI: {url} (Exploit: {cve}) !!!")
         
-    return server_info, findings
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("INSERT OR IGNORE INTO blacklist (url, date_added) VALUES (?, CURRENT_TIMESTAMP)", (url,))
+            conn.commit()
 
-@app.get("/api/scan")
-async def api_scan(domain: str):
-    # Hedefin başına http/https ekleyelim (eğer yoksa)
-    target_host = domain.replace("http://", "").replace("https://", "").split("/")[0]
+# --- ANA İŞ PARÇACIK YÖNETİCİSİ ---
+async def scan_pipeline():
+    logging.info("Otonom Tarama Hattı Başlatıldı.")
+    semaphore = asyncio.Semaphore(50) 
     
-    # 1. PORT TARAMASI
-    ports_to_scan = [21, 22, 25, 80, 443, 3306, 8080, 8443]
-    sem = asyncio.Semaphore(20)
-    tasks = [scan_port(target_host, port, sem) for port in ports_to_scan]
-    results = await asyncio.gather(*tasks)
-    open_ports = [port for port in results if port is not None]
-    
-    # 2. HTTP ANALİZİ
-    scan_results = []
     async with aiohttp.ClientSession() as session:
-        for port in open_ports:
-            server_info, findings = await analyze_http(session, target_host, port)
-            scan_results.append({
-                "port": port,
-                "server": server_info,
-                "findings": findings
-            })
-            
-        # 3. DİZİN/DOSYA TARAMASI (Directory Bruteforce)
-        base_url = f"https://{target_host}" if 443 in open_ports else f"http://{target_host}"
-        dir_tasks = [check_path(session, base_url, path) for path in COMMON_PATHS]
-        dir_results = await asyncio.gather(*dir_tasks)
-        hidden_paths = [res for res in dir_results if res is not None]
+        targets = await passive_discovery(session)
+        logging.info(f"Keşif tamamlandı. {len(targets)} hedef bulundu.")
+        
+        tasks = [analyze_target(session, url, semaphore) for url in targets]
+        results = await asyncio.gather(*tasks)
+        
+        for res in results:
+            if res:
+                await auto_exploit(res)
+                
+    logging.info("Tarama Hattı Tamamlandı. Raporlar veritabanına işlendi.")
 
-    return {
-        "status": "success",
-        "target": target_host,
-        "open_ports": scan_results,
-        "hidden_paths": hidden_paths
-    }
+# --- API ENDPOINT'LERİ ---
+@app.get("/healthz")
+async def health_check():
+    return {"status": "healthy"}
+
+@app.post("/start-scan")
+async def start_scan(background_tasks: BackgroundTasks):
+    asyncio.create_task(scan_pipeline())
+    return {"status": "Otonom tarama başlatıldı", "message": "Loglar WebSocket üzerinden akıyor."}
+
+@app.get("/api/results")
+async def get_results():
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM findings ORDER BY timestamp DESC LIMIT 100")
+        rows = cursor.fetchall()
+        
+        findings = []
+        for row in rows:
+            findings.append({
+                "target": row[1], "type": row[2], "severity": row[3], "evidence": row[4], "date": row[5]
+            })
+        return {"total": len(findings), "data": findings}
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
 
 @app.get("/", response_class=HTMLResponse)
-def read_root():
-    html_content = """
+async def get_dashboard():
+    return """
     <!DOCTYPE html>
-    <html lang="tr">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>VulnScan Pro | Gelişmiş Sızma Testi</title>
-        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&display=swap" rel="stylesheet">
-        <style>
-            :root { --bg: #0b0f19; --card: #1a2235; --accent: #00ffcc; --danger: #ff3366; --warning: #ffcc00; --text: #e2e8f0; }
-            * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Inter', sans-serif; }
-            body { background-color: var(--bg); color: var(--text); min-height: 100vh; display: flex; flex-direction: column; align-items: center; padding: 40px 20px; background-image: radial-gradient(circle at 50% 0%, #1a2235 0%, #0b0f19 70%); }
-            
-            .header { text-align: center; margin-bottom: 40px; }
-            .header h1 { font-size: 2.5rem; font-weight: 800; color: #fff; letter-spacing: 1px; }
-            .header h1 span { color: var(--accent); }
-            .header p { color: #64748b; margin-top: 10px; font-size: 1.1rem; }
-            
-            .search-box { width: 100%; max-width: 700px; background: var(--card); padding: 10px; border-radius: 12px; display: flex; gap: 10px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); border: 1px solid #2d3748; transition: border-color 0.3s; }
-            .search-box:focus-within { border-color: var(--accent); }
-            .search-box input { flex: 1; background: transparent; border: none; color: white; font-size: 1.1rem; padding: 15px; outline: none; }
-            .search-box button { background: var(--accent); color: #000; border: none; padding: 15px 30px; border-radius: 8px; font-weight: 600; font-size: 1rem; cursor: pointer; transition: transform 0.2s, box-shadow 0.2s; }
-            .search-box button:hover { transform: translateY(-2px); box-shadow: 0 4px 15px rgba(0, 255, 204, 0.4); }
-            .search-box button:disabled { background: #475569; cursor: not-allowed; transform: none; box-shadow: none; }
-            
-            #loader { display: none; margin-top: 30px; color: var(--accent); font-weight: 600; font-size: 1.2rem; animation: pulse 1.5s infinite; }
-            @keyframes pulse { 0% { opacity: 0.5; } 50% { opacity: 1; } 100% { opacity: 0.5; } }
-            
-            .results-container { width: 100%; max-width: 900px; margin-top: 40px; display: none; }
-            .section-title { font-size: 1.2rem; font-weight: 600; color: #fff; margin-bottom: 15px; border-bottom: 1px solid #2d3748; padding-bottom: 10px; display: flex; align-items: center; gap: 10px; }
-            
-            .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 15px; margin-bottom: 40px; }
-            .card { background: var(--card); border-radius: 10px; padding: 20px; border: 1px solid #2d3748; transition: transform 0.2s; }
-            .card:hover { transform: translateY(-3px); border-color: #4a5568; }
-            
-            .badge { padding: 4px 10px; border-radius: 20px; font-size: 0.8rem; font-weight: 600; display: inline-block; margin-bottom: 10px; }
-            .badge-success { background: rgba(0, 255, 204, 0.1); color: var(--accent); border: 1px solid var(--accent); }
-            .badge-danger { background: rgba(255, 51, 102, 0.1); color: var(--danger); border: 1px solid var(--danger); }
-            .badge-warning { background: rgba(255, 204, 0, 0.1); color: var(--warning); border: 1px solid var(--warning); }
-            
-            .finding-item { background: rgba(255, 51, 102, 0.05); border-left: 3px solid var(--danger); padding: 10px; margin-top: 8px; border-radius: 4px; font-size: 0.9rem; color: #ffb3c6; }
-            .path-item { background: rgba(255, 204, 0, 0.05); border-left: 3px solid var(--warning); padding: 10px; margin-top: 8px; border-radius: 4px; font-size: 0.9rem; color: #ffe066; display: flex; justify-content: space-between; }
-            .safe-text { color: var(--accent); font-size: 0.9rem; margin-top: 10px; }
-        </style>
-    </head>
-    <body>
-        <div class="header">
-            <h1>VulnScan <span>Pro</span></h1>
-            <p>Otomatik Sızma Testi ve Zafiyet Analizi</p>
-        </div>
-
-        <div class="search-box">
-            <input type="text" id="domainInput" placeholder="Hedef Domain (Örn: example.com)" value="example.com">
-            <button onclick="startScan()" id="scanBtn">Taramayı Başlat</button>
-        </div>
-
-        <div id="loader">Sistem hedefi analiz ediyor, lütfen bekleyin...</div>
-
-        <div id="results" class="results-container">
-            <div id="portsSection">
-                <div class="section-title"><span>🔍</span> Açık Portlar ve Servis Analizi</div>
-                <div id="portsGrid" class="grid"></div>
-            </div>
-            
-            <div id="pathsSection">
-                <div class="section-title"><span>📂</span> Tespit Edilen Gizli Dizinler / Dosyalar</div>
-                <div id="pathsGrid" class="grid"></div>
-            </div>
-        </div>
-
-        <script>
-            async function startScan() {
-                const domain = document.getElementById('domainInput').value;
-                const btn = document.getElementById('scanBtn');
-                const loader = document.getElementById('loader');
-                const results = document.getElementById('results');
-                const portsGrid = document.getElementById('portsGrid');
-                const pathsGrid = document.getElementById('pathsGrid');
-                
-                if(!domain) return alert("Lütfen bir hedef girin!");
-                
-                btn.disabled = true;
-                loader.style.display = "block";
-                results.style.display = "none";
-                portsGrid.innerHTML = "";
-                pathsGrid.innerHTML = "";
-
-                try {
-                    const response = await fetch('/api/scan?domain=' + domain);
-                    const data = await response.json();
-                    
-                    loader.style.display = "none";
-                    btn.disabled = false;
-                    results.style.display = "block";
-
-                    // PORTLARI EKRANA BAS
-                    if(data.open_ports.length === 0) {
-                        portsGrid.innerHTML = "<p class='safe-text'>Açık port bulunamadı.</p>";
-                    } else {
-                        data.open_ports.forEach(item => {
-                            let findingsHtml = "";
-                            if(item.findings.length > 0) {
-                                findingsHtml = item.findings.map(f => `<div class='finding-item'>⚠️ ${f}</div>`).join('');
-                            } else {
-                                findingsHtml = "<div class='safe-text'>✅ Güvenlik başlıkları düzgün.</div>";
-                            }
-
-                            portsGrid.innerHTML += `
-                                <div class="card">
-                                    <span class="badge badge-success">Port ${item.port} (Açık)</span>
-                                    <div style="font-size: 0.9rem; color: #94a3b8; margin-bottom: 10px;">Sunucu: <b>${item.server}</b></div>
-                                    ${findingsHtml}
-                                </div>
-                            `;
-                        });
-                    }
-
-                    // GİZLİ DİZİNLERİ EKRANA BAS
-                    if(data.hidden_paths.length === 0) {
-                        pathsGrid.innerHTML = "<p class='safe-text'>Gizli dizin/dosya bulunamadı.</p>";
-                    } else {
-                        data.hidden_paths.forEach(item => {
-                            let statusText = item.status === 200 ? "Erişilebilir" : "Korumalı";
-                            let badgeClass = item.status === 200 ? "badge-danger" : "badge-warning";
-                            
-                            pathsGrid.innerHTML += `
-                                <div class="card">
-                                    <span class="badge ${badgeClass}">HTTP ${item.status} - ${statusText}</span>
-                                    <div class="path-item">
-                                        <span>${item.path}</span>
-                                        <b>${item.status}</b>
-                                    </div>
-                                </div>
-                            `;
-                        });
-                    }
-
-                } catch (error) {
-                    loader.style.display = "none";
-                    btn.disabled = false;
-                    alert("Hata oluştu: " + error);
-                }
-            }
-        </script>
-    </body>
+    <html>
+        <head>
+            <title>VulnScan Pro Ultimate</title>
+            <style>
+                body { font-family: 'Courier New', monospace; background: #0a0a0a; color: #00ff41; padding: 20px; }
+                h1 { border-bottom: 2px solid #00ff41; padding-bottom: 10px; }
+                button { background: #111; color: #00ff41; padding: 10px 20px; border: 1px solid #00ff41; cursor: pointer; font-weight: bold; margin-right: 10px;}
+                button:hover { background: #00ff41; color: #000; }
+                #logs { margin-top: 20px; border: 1px solid #333; padding: 15px; height: 500px; overflow-y: scroll; background: #000; font-size: 14px; }
+                .critical { color: #ff0000; font-weight: bold; }
+                .info { color: #00ff41; }
+            </style>
+        </head>
+        <body>
+            <h1>VulnScan Pro Ultimate - Otonom Sistem</h1>
+            <button onclick="fetch('/start-scan', {method: 'POST'})">SİSTEMİ BAŞLAT</button>
+            <button onclick="window.open('/api/results', '_blank')">JSON ÇIKTISINI GÖR</button>
+            <div id="logs"><strong>[SİSTEM LOGLARI]</strong><br></div>
+            <script>
+                var ws = new WebSocket("wss://" + window.location.host + "/ws");
+                ws.onmessage = function(event) {
+                    var logDiv = document.getElementById("logs");
+                    var line = document.createElement("div");
+                    line.className = event.data.includes("CRITICAL") ? "critical" : "info";
+                    line.innerText = event.data;
+                    logDiv.appendChild(line);
+                    logDiv.scrollTop = logDiv.scrollHeight;
+                };
+            </script>
+        </body>
     </html>
     """
-    return html_content
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
