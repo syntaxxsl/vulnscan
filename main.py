@@ -6,6 +6,7 @@ import asyncio
 
 app = FastAPI(title="VulnScan API")
 
+# Veritabanı başlatma
 def init_db():
     conn = sqlite3.connect("vulnscan.db")
     c = conn.cursor()
@@ -45,7 +46,7 @@ def list_targets():
     targets = [row[0] for row in rows]
     return {"targets": targets}
 
-# SOKET TABANLI PORT TARAYICI (Nmap gerektirmez)
+# SOKET TABANLI PORT TARAYICI YARDIMCI FONKSİYONU
 def check_port(host, port):
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -56,7 +57,8 @@ def check_port(host, port):
         pass
     return None
 
-@app.get("/scan/{domain}")
+# YENİ SORGULU (QUERY) TARAMA MOTORU
+@app.get("/scan")
 async def scan_target(domain: str):
     try:
         # En yaygın portları kontrol ediyoruz
